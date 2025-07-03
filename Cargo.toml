@@ -1,0 +1,10 @@
+[package]
+name = "ssdbenchmark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vroom = {path = "../vroom"}
+byteorder = "1"
+rand = "0.9.1"
+textplots = "0.8"
