@@ -1,8 +1,9 @@
 use std::error::Error;
 use std::{env, process};
 
-mod features;
 mod util;
+mod features;
+mod benchmarks;
 
 pub fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args();
@@ -11,7 +12,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let pci_addr = match args.next() {
         Some(arg) => arg,
         None => {
-            eprintln!("Usage: cargo run --example hello_world <pci bus id>");
+            eprintln!("Usage: ./nvmebench <pci bus id>");
             process::exit(1);
         }
     };
@@ -21,8 +22,15 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     features::print_identify_controller_info(&nvme.identify_controller_info);
 
-    nvme = util::determine_cache_size(nvme);
-    nvme = util::simple_test(nvme);
+    nvme = benchmarks::determine_cache_size(nvme, 1024*1024*1024 / 8);
+    nvme = benchmarks::full_random_combinations(nvme);
+    println!("");
+    nvme = benchmarks::single_lba(nvme, true);
+    nvme = benchmarks::single_lba(nvme, false);
+    println!("");
+    nvme = benchmarks::zipf_single_action(nvme, true);
+    nvme = benchmarks::zipf_single_action(nvme, false);
+
 
     Ok(())
 }
