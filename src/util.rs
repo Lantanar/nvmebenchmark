@@ -1,5 +1,5 @@
 use core::num;
-use std::{cmp::min, time::Instant};
+use std::{cmp::min, io, result, time::{Duration, Instant}};
 use rand::{rngs::SmallRng, seq::SliceRandom, RngCore, SeedableRng};
 use std::error::Error;
 use vroom::{memory::{Dma, DmaSlice}, NvmeQueuePair};
@@ -26,11 +26,67 @@ impl std::fmt::Display for QueuePairError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct IoLog {
+    pub start: Instant,
+    pub end: Instant,
+    pub actions: usize,
+    pub cumulative_size: usize,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Allocation {
     pub lba: u64,
     pub start: usize,
     pub stop: usize,
+}
+
+/**
+ * @returns a vector of chronological sorted (actions, cumulative_size) tuples, each representing a bucket of the given duration
+ */
+pub fn combine_results(results: &Vec<Vec<IoLog>>, bucket_duration: Duration) -> Vec<(f64, f64)> {
+
+    let results : Vec<_> = results.iter().filter(|v| !v.is_empty()).collect();
+    if results.is_empty() {
+        return Vec::new();
+    }
+
+    let min_start = results.iter().map(|x| x.into_iter().min_by_key(|log| log.start).unwrap()).min_by_key(|log| log.start).unwrap().start;
+    let max_end = results.iter().map(|x| x.into_iter().max_by_key(|log| log.end).unwrap()).max_by_key(|log| log.end).unwrap().end;
+    let total_duration = max_end.duration_since(min_start);
+    let num_buckets = (total_duration.as_micros() / bucket_duration.as_micros() + 1) as usize;
+
+    let mut results_combined = vec![(0.0,0.0); num_buckets];
+
+    for io_log in results.iter().flat_map(|x| x.iter()) {
+        let log_duration = io_log.end.duration_since(io_log.start);
+        if log_duration.is_zero() {
+            continue;
+        }
+
+        // normalize all duration to the first logged start time
+        let start_offset = io_log.start - min_start;
+        let end_offset = io_log.end - min_start;
+
+        let mut current_time = start_offset;
+
+        while current_time < end_offset {
+            let bucket_index = (current_time.as_secs_f64() / bucket_duration.as_secs_f64()) as usize;
+            if bucket_index >= num_buckets { break; }
+
+            let bucket_end_time = (bucket_index + 1) as f64 * bucket_duration.as_secs_f64();
+            let overlap_end = end_offset.as_secs_f64().min(bucket_end_time);
+
+            let overlap_share = (overlap_end - current_time.as_secs_f64()) / log_duration.as_secs_f64();
+
+            results_combined[bucket_index].0 += overlap_share * io_log.actions as f64;
+            results_combined[bucket_index].1 += overlap_share * io_log.cumulative_size as f64;
+
+            current_time = Duration::from_secs_f64(overlap_end);
+        }
+    }
+
+    results_combined
 }
 
 pub fn threadsafe_io_batch_complete_64(mut queue_pair: NvmeQueuePair, ns_id: u32, block_size: u64, data: (&Dma<u8>, &Vec<Allocation >), write: bool) -> Result<NvmeQueuePair, Box<QueuePairError>> {

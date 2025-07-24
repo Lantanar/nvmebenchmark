@@ -1,80 +1,140 @@
-use crate::util::{construct_allocation_from_distribution, construct_random_allocations, create_random_data, get_random_safe_start, print_2x2, threadsafe_io_batch_complete_64, QueuePairError, ONE_GIB};
+use crate::util::{construct_allocation_from_distribution, construct_random_allocations, create_random_data, get_random_safe_start, print_2x2, threadsafe_io_batch_complete_64, IoLog, QueuePairError, ONE_GIB};
 use rand_distr::Zipf;
-use vroom::{NvmeQueuePair, memory::{Dma, DmaSlice}, NvmeDevice, HUGE_PAGE_SIZE};  
+use vroom::{memory::{Dma, DmaSlice}, queues, NvmeDevice, NvmeQueuePair, HUGE_PAGE_SIZE};  
 use rand::{rngs::SmallRng, Rng, RngCore, SeedableRng};
-use std::{cmp::min, time::Instant};
+use std::{cmp::{max, min}, io, sync::{Arc, Mutex}, time::Instant};
 
 
-pub fn determine_cache_size(mut nvme: NvmeDevice, max_write: i64) -> NvmeDevice {
-    let mut max_write = if max_write <= 0 {
+pub fn determine_cache_size(mut nvme: NvmeDevice, max_io: u64, single_io_size: u64, write: bool, queue_depth: usize, num_threads: usize) -> (NvmeDevice, Vec<Vec<IoLog>>) {
+    let mut max_write = if max_io == 0 {
         ONE_GIB * 8
     } else {
-        max_write as u64
+        max_io
     };
 
     let ns = nvme.namespaces.get(&1).unwrap();
     let max_blocks = ns.blocks;
     let ns_id = ns.id;
     let block_size = ns.block_size;
-    let dma = create_random_data(HUGE_PAGE_SIZE);
+
+    let batch_size = queue_depth;
+
+    //needs to be a multiple of block_size, maximum size: HUGE_PAGE_SIZE-1
+    let io_size = min(single_io_size, HUGE_PAGE_SIZE as u64 - block_size);
+    let io_size  = io_size - (io_size % block_size);
+    //approximate amount of loops per results save / atleast so many loops need to be completed once before it is allowed to stop
+    let step_size = max(io_size / 8192, 1) * 32;
 
     if max_write >= max_blocks * block_size {
         max_write = max_blocks * block_size / 2;
     }
 
-    let mut results = Vec::new();
+    let mut handles = Vec::with_capacity(num_threads);
 
-    let mut rng = SmallRng::seed_from_u64(Instant::now().elapsed().as_millis() as u64);
+    let mut queues = Vec::new();
 
-    let batch_size = 64;
+    for _ in 0..num_threads {
+        //minimum queue size to not run into issues with a single submit command with a size of 2 MiB
+        queues.push(nvme.create_io_queue_pair(max(queue_depth*2,512)).unwrap());
+    }
 
-    let step_size = HUGE_PAGE_SIZE as u64 / block_size;
-    let mut it_check = 0;
-    let mut total = 0;
-    let mut cumulative_actions: usize = 0;
-    let mut t = 0;
-    let mut last_t = 0;
-    let start_block = rng.next_u64() % (max_blocks - max_write / block_size);
-    let mut queue_pair = nvme.create_io_queue_pair(batch_size * 2).unwrap();
-    let mut start = Instant::now();
-
-    while (t < last_t * 4 / 3 && it_check < max_write / block_size) || it_check < step_size*8 {
-
-        let res = queue_pair.submit_io(ns_id, block_size, &dma.slice(0..block_size as usize), start_block+it_check, true);
-        if res == 0 {
-            println!("Request was not queued, results will be inaccurate");
-        }
-
-        total += res;
+    let queues = Arc::new(Mutex::new(queues));
     
-        if total > batch_size {
-            //complete, but don't let the submission queue run out of entries
-            queue_pair.complete_io(total/2);
-            cumulative_actions += total / 2;
-            total -= total / 2;
 
-            if cumulative_actions > step_size as usize {
-                let duration = start.elapsed();
-                last_t = t;
-                t = duration.as_micros();
-                results.push((cumulative_actions, t));
-                cumulative_actions = 0;
-                start = Instant::now();
+    for i in 0..num_threads {
+        let shared_queues = queues.clone();
+
+        let handle = std::thread::spawn(move || {
+            let mut results = Vec::new();
+            let mut guard = shared_queues.lock().unwrap();
+            let mut queue_pair = guard.pop().unwrap();
+            drop(guard);
+
+            let dma = create_random_data(io_size as usize);
+
+            //let mut rng = SmallRng::seed_from_u64(Instant::now().elapsed().as_millis() as u64);
+
+            let mut it_check = 0;
+            let mut total = 0;
+            let mut cumulative_actions: usize = 0;
+            let mut t = 0;
+            /*let mut last_t = 0;
+            let mut dropoff_flag = false;
+            let mut end_counter = 0;
+            let mut it_start_dropoff = 1;*/
+            //let start_block = rng.next_u64() % (max_blocks - max_write / block_size);
+            let start_block = (max_io / block_size) * i as u64;
+            
+            let mut start = Instant::now();
+
+            while it_check < max_write / io_size {
+
+                let res = queue_pair.submit_io(ns_id, block_size, &dma.slice(0..io_size as usize), start_block+it_check*(io_size/block_size), write);
+                if res == 0 {
+                    eprintln!("Request was not queued, results will be inaccurate");
+                }
+
+                total += res;
+
+                while let Some(_) = queue_pair.quick_poll() {
+                    total -= 1;
+                    cumulative_actions += 1;
+                }
+
+                if total >= batch_size {
+                    queue_pair.complete_io(total+1-batch_size);
+                    cumulative_actions += total+1-batch_size;
+                    total -= total+1-batch_size;
+                }
+                
+
+                if cumulative_actions > step_size as usize {
+                    let end = Instant::now();
+                    //last_t = t;
+                    t = end.duration_since(start).as_micros();
+
+                    /*
+                    if !dropoff_flag && (it_check >= step_size*8) && (t * 3 >= last_t * 4) {
+                        dropoff_flag = true;
+                        it_start_dropoff = it_check / 2;
+                    }*/
+
+                    results.push(IoLog {
+                        start,
+                        end,
+                        actions: cumulative_actions,
+                        cumulative_size: (cumulative_actions * 8192) as usize,
+                    });
+
+                    cumulative_actions = 0;
+                    start = Instant::now();
+                }
+            
+                /* 
+                if dropoff_flag {
+                    end_counter += 1;
+                }*/
+                
+                it_check += 1;
             }
-        }
-        
-        it_check += 1;
-    }
-    if total > 0 {
-        queue_pair.complete_io(total);
-        let duration = start.elapsed();
-        t = duration.as_micros();
-        results.push((total + cumulative_actions, t));
+            if total > 0 {
+                queue_pair.complete_io(total);
+            }
+            return (results, queue_pair);
+        });
+        handles.push(handle);
     }
 
+    eprintln!("{:?}", &handles);
 
-    nvme.delete_io_queue_pair(queue_pair);
+    let mut results = Vec::new();
+    for handle in handles {
+        let (res, queue_pair) = handle.join().unwrap();
+        nvme.delete_io_queue_pair(queue_pair);
+        results.push(res);
+    }
 
+    /* 
     if it_check >= step_size*8 {
         println!("Could not detect cache size, tested: {}MiB", it_check * block_size / (1024 * 1024));
     } else {
@@ -98,9 +158,9 @@ pub fn determine_cache_size(mut nvme: NvmeDevice, max_write: i64) -> NvmeDevice 
         }
     }
 
-    condensed.iter().for_each(|x| println!("{} MiB/s", x));
+    condensed.iter().for_each(|x| println!("{} MiB/s", x));*/
 
-    nvme
+    (nvme, results)
 }
 
 pub fn single_lba(mut nvme: NvmeDevice, write: bool) -> NvmeDevice {
